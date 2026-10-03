@@ -126,4 +126,89 @@ describe("NotificationService", () => {
             notificationId: "event-42",
         });
     });
+
+    it("deduplicates device tokens before delivery", async () => {
+        const repository = new MemoryDeviceTokenRepository(["same", "same", "other"]);
+        const sendEachForMulticast = vi.fn(async (message: MulticastMessage) => allSuccessful(message));
+        const service = new NotificationService(repository, { sendEachForMulticast });
+
+        const report = await service.sendToUser({ userId: "user-1", title: "Title", body: "Body" });
+
+        expect(sendEachForMulticast.mock.calls[0]?.[0].tokens).toEqual(["same", "other"]);
+        expect(report).toMatchObject({ targeted: 2, sent: 2, failed: 0 });
+    });
+
+    it("reports non-retryable Firebase failures without retrying", async () => {
+        const repository = new MemoryDeviceTokenRepository(["token-1"]);
+        const sendEachForMulticast = vi.fn().mockResolvedValue({
+            successCount: 0,
+            failureCount: 1,
+            responses: [{
+                success: false,
+                error: { code: "messaging/invalid-argument", message: "bad payload" },
+            }],
+        });
+        const service = new NotificationService(repository, { sendEachForMulticast });
+
+        const report = await service.sendToUser({ userId: "user-1", title: "Title", body: "Body" });
+
+        expect(sendEachForMulticast).toHaveBeenCalledTimes(1);
+        expect(report).toMatchObject({ sent: 0, failed: 1 });
+        expect(report.errorCounts).toEqual({ "messaging/invalid-argument": 1 });
+    });
+
+    it("uses exponential backoff and stops after the retry limit", async () => {
+        const repository = new MemoryDeviceTokenRepository(["token-1"]);
+        const sendEachForMulticast = vi.fn().mockResolvedValue({
+            successCount: 0,
+            failureCount: 1,
+            responses: [{
+                success: false,
+                error: { code: "messaging/server-unavailable", message: "temporary" },
+            }],
+        });
+        const sleep = vi.fn(async () => undefined);
+        const service = new NotificationService(repository, { sendEachForMulticast }, 3, sleep);
+
+        const report = await service.sendToUser({ userId: "user-1", title: "Title", body: "Body" });
+
+        expect(sendEachForMulticast).toHaveBeenCalledTimes(3);
+        expect(sleep.mock.calls.map(([milliseconds]) => milliseconds)).toEqual([100, 200]);
+        expect(report.errorCounts).toEqual({ "messaging/server-unavailable": 1 });
+        expect(report.failed).toBe(1);
+    });
+
+    it("retries transport errors and surfaces the final failure", async () => {
+        const repository = new MemoryDeviceTokenRepository(["token-1"]);
+        const sendEachForMulticast = vi.fn().mockRejectedValue(new Error("network unavailable"));
+        const sleep = vi.fn(async () => undefined);
+        const service = new NotificationService(repository, { sendEachForMulticast }, 2, sleep);
+
+        await expect(service.sendToUser({ userId: "user-1", title: "Title", body: "Body" }))
+            .rejects.toThrow("network unavailable");
+        expect(sendEachForMulticast).toHaveBeenCalledTimes(2);
+        expect(sleep).toHaveBeenCalledWith(100);
+    });
+
+    it("keeps a successful delivery report when invalid-token cleanup fails", async () => {
+        const repository = new MemoryDeviceTokenRepository(["expired"]);
+        repository.removeTokens = async () => { throw new Error("Firestore unavailable"); };
+        const sendEachForMulticast = vi.fn().mockResolvedValue({
+            successCount: 0,
+            failureCount: 1,
+            responses: [{
+                success: false,
+                error: { code: "messaging/registration-token-not-registered", message: "expired" },
+            }],
+        });
+        const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+        try {
+            const report = await new NotificationService(repository, { sendEachForMulticast })
+                .sendToUser({ userId: "user-1", title: "Title", body: "Body" });
+            expect(report.removedInvalidTokens).toBe(0);
+            expect(report.errorCounts["internal/token-cleanup-failed"]).toBe(1);
+        } finally {
+            consoleError.mockRestore();
+        }
+    });
 });
